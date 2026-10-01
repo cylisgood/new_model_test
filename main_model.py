@@ -30,7 +30,6 @@ latest_result = {
         "standing": 0,
         "sitting": 0,
         "resting": 0,
-        "climbing": 0,
     },
 }
 
@@ -62,7 +61,7 @@ def update_latest_result(tracks):
     """
     global latest_result
 
-    summary = {"walking": 0, "standing": 0, "sitting": 0, "resting": 0, "climbing": 0}
+    summary = {"walking": 0, "standing": 0, "sitting": 0, "resting": 0}
     top_behavior = "unknown"
     top_confidence = 0.0
 
@@ -104,7 +103,6 @@ def mark_offline():
             "standing": 0,
             "sitting": 0,
             "resting": 0,
-            "climbing": 0,
         },
     }
 

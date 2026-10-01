@@ -15,8 +15,6 @@
   | `standing` | 低速、或原地晃動 | `standing` |
   | `sitting` | 靜止、脊椎偏直且後腳收起 | `sitting` |
   | `lying` | 靜止、脊椎接近水平 | `resting` |
-
-  `climbing` 欄位目前只是預留，尚未實作，數值恆為 0。
 - **三種輸入來源**：本機攝影機、RTSP / HTTP 串流、影片檔。
 - **FastAPI 伺服器**：HTTP、WebSocket、MJPEG 即時影像；來源斷線時每 5 秒自動重連。
 
@@ -101,7 +99,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
   "status": "online",
   "behavior": "walking",
   "confidence": 0.82,
-  "summary": { "walking": 1, "standing": 0, "sitting": 0, "resting": 0, "climbing": 0 }
+  "summary": { "walking": 1, "standing": 0, "sitting": 0, "resting": 0 }
 }
 ```
 
