@@ -1,0 +1,16 @@
+# Virtual environment (several GB)
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Large media / model outputs (GitHub rejects files > 100 MB)
+input/
+output/
+
+# Local env / editor files
+.env
+.vscode/
+.idea/
