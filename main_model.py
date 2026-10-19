@@ -36,6 +36,15 @@ latest_result = {
 # 給 server.py /video_feed 讀取的最新一幀畫面（純攝影機原始畫面，不含骨架疊圖）
 latest_frame_jpeg = None
 
+# 即時來源目前是否連著。來源中斷時分析執行緒還會把已錄好的片段分析完，
+# 不能讓那些「舊片段的結果」把 /current 又變回 online
+source_connected = False
+
+
+def set_source_connected(value):
+    global source_connected
+    source_connected = bool(value)
+
 
 def update_latest_frame(frame):
     global latest_frame_jpeg
@@ -84,7 +93,7 @@ def update_latest_result(tracks):
             top_behavior = mapped_action or action
 
     latest_result = {
-        "status": "online",
+        "status": "online" if source_connected else "offline",
         "behavior": top_behavior,
         "confidence": round(top_confidence, 2),
         "summary": summary,
@@ -94,6 +103,7 @@ def update_latest_result(tracks):
 def mark_offline():
     """鏡頭來源斷線、正在等待重試時呼叫，讓 /current 如實反映目前沒有資料可看。"""
     global latest_result
+    set_source_connected(False)
 
     latest_result = {
         "status": "offline",
@@ -115,12 +125,46 @@ def mark_offline():
 PROJECT_DIR = Path(os.getenv("PROJECT_DIR", str(Path(__file__).resolve().parent)))
 
 VIDEO_PATH = os.getenv("VIDEO_PATH", str(PROJECT_DIR / "input" / "dog_3.mp4"))
-SOURCE_MODE = os.getenv("SOURCE_MODE", "webcam").strip().lower()
-if SOURCE_MODE not in {"webcam", "stream", "video"}:
-    SOURCE_MODE = ("stream")
+
+STREAM_URL_ENV_NAMES = ("HUB_AI_STREAM", "RTSP_URL")   # 前面的優先；網址一律從環境變數來，程式裡不寫死 IP / 帳密
+
+
+def read_stream_url(env=None):
+    """HUB_AI_STREAM 優先，沒有才用 RTSP_URL；都沒設就回傳空字串。"""
+    env = os.environ if env is None else env
+
+    for name in STREAM_URL_ENV_NAMES:
+        value = env.get(name, "").strip()
+
+        if value:
+            return value
+
+    return ""
+
+
+def read_source_mode(env=None, stream_url=""):
+    """
+    SOURCE_MODE 沒有明確指定時：有設串流網址就用串流，沒有才用本機攝影機。
+    （避免設了 HUB_AI_STREAM 卻忘了設 SOURCE_MODE，結果默默打開本機鏡頭。）
+    """
+    env = os.environ if env is None else env
+    raw = env.get("SOURCE_MODE", "").strip().lower()
+
+    if not raw:
+        return "stream" if stream_url else "webcam"
+
+    return raw if raw in {"webcam", "stream", "video"} else "stream"
+
+
+def redact_url(url):
+    """拿掉網址裡的 user:pass@，避免帳密被印出來或進到檔名。"""
+    return re.sub(r"//[^/@]*@", "//", str(url))
+
+
+STREAM_URL = read_stream_url()
+SOURCE_MODE = read_source_mode(stream_url=STREAM_URL)
 
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
-STREAM_URL = os.getenv("RTSP_URL", "").strip()
 
 # ============================================================
 # 自動輸出路徑
@@ -167,8 +211,8 @@ def resolve_input_source():
 
     if SOURCE_MODE == "stream":
         if not STREAM_URL:
-            raise ValueError("SOURCE_MODE=stream 時請設定 STREAM_URL")
-        return "stream", STREAM_URL, sanitize_source_name(STREAM_URL)
+            raise ValueError("SOURCE_MODE=stream 時請設定環境變數 HUB_AI_STREAM（或 RTSP_URL）")
+        return "stream", STREAM_URL, sanitize_source_name(redact_url(STREAM_URL))
 
     if SOURCE_MODE == "video":
         video_file = Path(VIDEO_PATH)
@@ -192,12 +236,90 @@ def open_capture(capture_source, mode):
 
         return cv2.VideoCapture(int(capture_source))
 
-    # RTSP 低延遲設定：優先丟掉緩衝、避免長時間排隊
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|max_delay;0|buffer_size;1024"
-    cap = cv2.VideoCapture(str(capture_source), cv2.CAP_FFMPEG)
+    # RTSP 設定：Hub 只收 TCP（用 UDP 的 SETUP 會被回 461 Unsupported Transport），所以指定 TCP；
+    # 另外要低延遲、不要排隊緩衝。
+    #
+    # 注意：在這台電腦實測（opencv-python 4.11.0.86、Windows），這個環境變數看起來沒有被套用——
+    # 連設成不存在的值 "rtsp_transport;nonsense" 都照樣連得上（用 ffmpeg 嚴格指定 UDP 則會被 Hub 回 461 而失敗）。
+    # 推測是 FFmpeg 先試 UDP、被 Hub 拒絕後自動退回 TCP，所以仍然連得上，只是連線要多花 1~2 秒；
+    # 這個推測沒有被完全證實（整合測試的 server 日誌裡就沒出現 461 警告，原因不明）。
+    # 設定留著，是為了在「確實會套用它」的環境裡能真的強制 TCP。
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;0|buffer_size;1024"
+
+    # 開啟 / 讀取逾時：OpenCV 預設是 30 秒，來源斷線時要等很久才發現，重連就跟著慢
+    cap = cv2.VideoCapture(
+        str(capture_source),
+        cv2.CAP_FFMPEG,
+        [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, STREAM_OPEN_TIMEOUT_MS,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_READ_TIMEOUT_MS,
+        ],
+    )
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+STREAM_OPEN_TIMEOUT_MS = 10000
+STREAM_READ_TIMEOUT_MS = 10000
+
+FPS_MEASURE_SECONDS = 5.0
+FPS_MEASURE_SETTLE_SECONDS = 1.0   # 剛連上時 RTSP 會連續送一小批緩衝的影格，前 1 秒不算
+RECONNECT_WAIT_SECONDS = 3.0       # 來源中斷後，每隔幾秒重試一次
+
+
+def measure_capture_fps(cap, seconds=FPS_MEASURE_SECONDS, settle=FPS_MEASURE_SETTLE_SECONDS, clock=time.monotonic):
+    """
+    實際讀幾秒，量真實「到手」的幀率。cap.get(CAP_PROP_FPS) 對串流來源不可信：
+    HTTP MJPEG 永遠回報 25（實測手機式串流 12 fps 時差了 105%），RTSP 回報的是串流宣告值
+    （Hub 的 cam_ai 宣告 15，實測 16.6）。而時間視窗與速度門檻都靠 fps 換算，所以要用實測值。
+
+    回傳 (fps 或 None, 最後讀到的一幀或 None)；讀得太少、量不出來時 fps 是 None。
+    """
+    start = clock()
+    stamps = []
+    last = None
+
+    while clock() - start < seconds:
+        ok, f = cap.read()
+
+        if not ok or f is None:
+            break
+
+        last = f
+        stamps.append(clock())
+
+    usable = [t for t in stamps if t - start >= settle]
+
+    if len(usable) < 3 or usable[-1] <= usable[0]:
+        return None, last
+
+    return (len(usable) - 1) / (usable[-1] - usable[0]), last
+
+
+def reconnect_capture(capture_source, mode, stop_event, wait=RECONNECT_WAIT_SECONDS):
+    """來源中斷後持續重試開啟，直到成功或 stop_event 被設定。回傳 (cap, 第一幀)；被中止時回傳 (None, None)。"""
+    attempt = 0
+
+    while not stop_event.is_set():
+        if stop_event.wait(wait):
+            break
+
+        attempt += 1
+        cap = open_capture(capture_source, mode)
+
+        if cap.isOpened():
+            ok, f = cap.read()
+
+            if ok and f is not None:
+                return cap, f
+
+        cap.release()
+
+        if attempt == 1 or attempt % 10 == 0:
+            print(f"⏳ 即時來源還連不上，持續重試中（第 {attempt} 次）...")
+
+    return None, None
 
 # ============================================================
 # DeepLabCut SuperAnimal-Quadruped 39 keypoints
@@ -1665,17 +1787,29 @@ def make_action_video_live_camera_like(capture_source, mode):
     if not cap.isOpened():
         raise RuntimeError("無法開啟即時影像來源")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 15.0
-
     ret, frame = cap.read()
     if not ret or frame is None:
         raise RuntimeError("無法從即時來源讀到第一幀")
 
+    # 幀率用實測值，不信 CAP_PROP_FPS（見 measure_capture_fps）。量測期間讀掉的幀不進片段，約 5 秒
+    declared_fps = cap.get(cv2.CAP_PROP_FPS)
+    measured_fps, last_frame = measure_capture_fps(cap)
+
+    if last_frame is not None:
+        frame = last_frame
+
+    if measured_fps is not None and 1.0 <= measured_fps <= 120.0:
+        fps = measured_fps
+        fps_note = f"實測 {measured_fps:.1f}（來源宣告 {declared_fps:g}）"
+    else:
+        fps = declared_fps if declared_fps > 0 else 15.0
+        fps_note = f"沒量到實測值，使用來源宣告值 {fps:g}"
+
     frame_h, frame_w = frame.shape[:2]
+    set_source_connected(True)
+
     print("即時來源解析度：", frame_w, "x", frame_h)
-    print("FPS：", fps)
+    print("FPS：", fps_note)
     print("每段分析長度：", CLIP_DURATION_SECONDS, "秒")
 
     stop_event = threading.Event()
@@ -1683,7 +1817,7 @@ def make_action_video_live_camera_like(capture_source, mode):
     frames_per_clip = max(1, int(round(fps * CLIP_DURATION_SECONDS)))
 
     def capture_and_clip_worker():
-        nonlocal frame
+        nonlocal frame, cap
 
         clip_index = 0
         writer = None
@@ -1692,7 +1826,34 @@ def make_action_video_live_camera_like(capture_source, mode):
         try:
             while not stop_event.is_set():
                 if frame is None:
-                    break
+                    # 來源中斷：就在這個執行緒裡重連，分析執行緒不受影響、整個程式不用重啟。
+                    # （舊作法是直接結束，要等佇列裡已錄好的片段全部分析完才會回傳，重連會慢上好幾分鐘）
+                    lost_at = time.time()
+                    print("⚠️ 即時來源中斷，開始重新連線...")
+                    set_source_connected(False)
+                    mark_offline()
+
+                    if writer is not None:  # 進行到一半的片段不完整，丟掉
+                        writer.release()
+                        writer = None
+                        clip_path.unlink(missing_ok=True)
+
+                    frame_count_in_clip = 0
+                    cap.release()
+
+                    new_cap, new_frame = reconnect_capture(capture_source, mode, stop_event)
+
+                    if new_cap is None:
+                        break
+
+                    cap, frame = new_cap, new_frame
+                    set_source_connected(True)
+                    print(f"✅ 即時來源已恢復（中斷約 {time.time() - lost_at:.0f} 秒）")
+                    continue
+
+                if frame.shape[:2] != (frame_h, frame_w):
+                    # 重連後解析度不同的話，VideoWriter 會默默丟掉尺寸不符的幀
+                    frame = cv2.resize(frame, (frame_w, frame_h))
 
                 update_latest_frame(frame)
 
