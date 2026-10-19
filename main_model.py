@@ -71,8 +71,9 @@ def update_latest_result(tracks):
         if not action_history:
             continue
 
-        action, count = Counter(action_history).most_common(1)[0]
-        confidence = count / len(action_history)
+        # 用去抖動後的最終行為（跟行為紀錄一致）；信心 = 最近的逐幀判斷裡有幾成同意這個行為
+        action = track.get("current_action") or Counter(action_history).most_common(1)[0][0]
+        confidence = Counter(action_history)[action] / len(action_history)
         mapped_action = BEHAVIOR_LABEL_MAP.get(action)
 
         if mapped_action in summary:
@@ -305,6 +306,15 @@ SITTING_MAX_HIP_TO_BACK_PAW = 0.45
 PATH_EFFICIENCY_THRES = 0.35  # 淨位移 / 總路徑長，低於此值視為「原地抖動」而非真的移動
 CAMERA_COMP_ENABLE = True      # 是否啟用鏡頭晃動補償
 
+# --- 行為標籤穩定化：視窗都以「秒」為單位，換算成幀數時才依影片 fps 調整 ---
+# classify_action() 裡的速度是「每幀位移 ÷ 體長」，STILL_THRES / WALK_THRES 等門檻
+# 是在約 30 FPS 的影片上調的，所以其他 fps 要先換算到這個基準，60 FPS 和 30 FPS 才會得到同樣的判斷
+REFERENCE_FPS = 30.0
+ACTION_VOTE_SECONDS = 0.33     # 逐幀判斷結果的多數決視窗（原本固定 10 幀）
+HISTORY_SECONDS = 1.0          # 追蹤歷史長度，用來算速度 / 姿態中位數（原本固定 30 幀）
+MIN_HISTORY_SECONDS = 0.27     # 歷史累積到這麼久才開始判斷行為（原本固定 8 幀）
+MIN_ACTION_SECONDS = 1.0       # 新行為要連續當多數這麼久才算數（去抖動），一閃而過的標籤不進行為紀錄
+
 # 多寵物顏色
 PET_COLORS = [
     (255, 0, 0),  # 藍色
@@ -334,9 +344,13 @@ def format_time(seconds):
     return f"{minutes:02d}:{sec:02d}"
 
 
-def update_behavior_segments(behavior_segments, active_segments, pet_id, action, frame_id):
+def update_behavior_segments(behavior_segments, active_segments, pet_id, action, frame_id, switch_frame=None):
     """
     根據每一幀的 action 更新行為區段紀錄。
+
+    switch_frame：行為切換「實際開始」的幀。去抖動（stabilize_action）要等新行為維持夠久才確認切換，
+    確認時已經比實際開始晚了一段時間，這裡把舊區段切在 switch_frame 之前、新區段從 switch_frame 開始，
+    紀錄才不會整體往後延遲。沒給就代表從目前這一幀開始。
     """
 
     if pet_id not in behavior_segments:
@@ -356,17 +370,69 @@ def update_behavior_segments(behavior_segments, active_segments, pet_id, action,
         current_segment["end_frame"] = frame_id
         return
 
+    new_start = frame_id if switch_frame is None else switch_frame
+    old_end = current_segment["end_frame"] if switch_frame is None else max(current_segment["start_frame"], switch_frame - 1)
+
     behavior_segments[pet_id].append({
         "action": current_segment["action"],
         "start_frame": current_segment["start_frame"],
-        "end_frame": current_segment["end_frame"]
+        "end_frame": old_end
     })
 
     active_segments[pet_id] = {
         "action": action,
-        "start_frame": frame_id,
+        "start_frame": new_start,
         "end_frame": frame_id
     }
+
+
+def seconds_to_frames(seconds, fps, minimum=1):
+    return max(minimum, int(round(seconds * fps)))
+
+
+def stabilize_action(track, frame_id, fps):
+    """
+    把「最近幾幀的多數決」再過一道去抖動（hysteresis）：
+    新行為必須連續當多數超過 MIN_ACTION_SECONDS，才會取代目前的行為；
+    中途只要多數又換成別的，就重新計時。這樣兩種標籤勢均力敵時不會一直來回切。
+
+    回傳 (action, switch_frame)：
+      action        這一幀最終輸出的行為
+      switch_frame  剛確認切換時，是新行為「第一次出現」的那一幀（回溯用）；沒有切換時是 None
+    """
+    votes = Counter(track["action_history"])
+    top = max(votes.values())
+    leaders = [a for a, c in votes.items() if c == top]
+
+    current = track.get("current_action")
+
+    # 平手時優先維持目前的行為，不要隨 Counter 的順序在兩者之間跳
+    vote = current if current in leaders else leaders[0]
+
+    # 還沒有任何行為，或還在 analyzing（資料不足的暫時標籤）：直接採用，不需要去抖動
+    if current is None or current == "analyzing":
+        track["current_action"] = vote
+        track["pending_action"] = None
+        return vote, None
+
+    if vote == current:
+        track["pending_action"] = None
+        return current, None
+
+    if track.get("pending_action") == vote:
+        track["pending_frames"] += 1
+    else:
+        track["pending_action"] = vote
+        track["pending_since"] = frame_id
+        track["pending_frames"] = 1
+
+    if track["pending_frames"] >= seconds_to_frames(MIN_ACTION_SECONDS, fps):
+        switch_frame = track["pending_since"]
+        track["current_action"] = vote
+        track["pending_action"] = None
+        return vote, switch_frame
+
+    return current, None
 
 
 def write_behavior_log(behavior_segments, active_segments, fps, video_name, output_path):
@@ -808,9 +874,11 @@ def process_behavior_frame(
     frame_h,
     camera_motion_cache,
     prev_gray,
+    fps=REFERENCE_FPS,
 ):
     """
     把單一 frame 的 detection / tracking / 行為判斷流程集中處理。
+    fps：影片 / 即時來源的幀率，行為判斷的時間視窗與速度門檻依它換算（見 REFERENCE_FPS）。
     """
     frame_actions = []
 
@@ -855,7 +923,7 @@ def process_behavior_frame(
             next_pet_id += 1
 
         if pet_id not in tracks:
-            tracks[pet_id] = create_new_track(det, frame_id)
+            tracks[pet_id] = create_new_track(det, frame_id, fps)
         else:
             update_track(tracks[pet_id], det, frame_id)
 
@@ -869,11 +937,12 @@ def process_behavior_frame(
             det["kpts"],
             det["scores"],
             camera_motion_cache=camera_motion_cache,
+            fps=fps,
         )
 
         tracks[pet_id]["action_history"].append(raw_action)
 
-        action = Counter(tracks[pet_id]["action_history"]).most_common(1)[0][0]
+        action, switch_frame = stabilize_action(tracks[pet_id], frame_id, fps)
         color = PET_COLORS[(pet_id - 1) % len(PET_COLORS)]
 
         frame_actions.append((pet_id, action, color))
@@ -884,6 +953,7 @@ def process_behavior_frame(
             pet_id,
             action,
             frame_id,
+            switch_frame,
         )
 
         draw_pose(frame, det["kpts"], det["scores"], color=color)
@@ -1196,9 +1266,9 @@ def compute_match_score(det, track):
     return score
 
 
-def create_new_track(det, frame_id):
-    history = deque(maxlen=30)
-    action_history = deque(maxlen=10)
+def create_new_track(det, frame_id, fps=REFERENCE_FPS):
+    history = deque(maxlen=seconds_to_frames(HISTORY_SECONDS, fps, 8))
+    action_history = deque(maxlen=seconds_to_frames(ACTION_VOTE_SECONDS, fps, 3))
 
     history.append({
         "center": det["center"],
@@ -1227,6 +1297,12 @@ def create_new_track(det, frame_id):
         "active": True,
         "hits": 1,
         "confirmed": TRACK_MIN_HITS <= 1,
+
+        # 最終輸出的行為與去抖動狀態（見 stabilize_action）
+        "current_action": None,
+        "pending_action": None,
+        "pending_since": None,
+        "pending_frames": 0,
     }
 
 
@@ -1419,9 +1495,13 @@ def median_filtered_mean(values):
 #   3. 扣除鏡頭晃動造成的位移，避免手震/鏡頭移動被誤判成寵物在跑
 # ============================================================
 
-def classify_action(history, frame_w, frame_h, kpts, scores, camera_motion_cache=None):
-    if len(history) < 8:
+def classify_action(history, frame_w, frame_h, kpts, scores, camera_motion_cache=None, fps=REFERENCE_FPS):
+    if len(history) < seconds_to_frames(MIN_HISTORY_SECONDS, fps, 4):
         return "analyzing"
+
+    # 速度是「每幀位移 ÷ 體長」，換算成 REFERENCE_FPS 下的每幀速度，門檻才不會因 fps 不同而失真
+    # （60 FPS 的每幀位移只有 30 FPS 的一半，乘 2 才等價）
+    speed_scale = fps / REFERENCE_FPS
 
     neck, tail, body_len = get_body_axis(kpts, scores)
 
@@ -1459,7 +1539,7 @@ def classify_action(history, frame_w, frame_h, kpts, scores, camera_motion_cache
             dy -= cam_dy
 
         d = math.hypot(dx, dy)
-        speeds.append(d / body_len)
+        speeds.append(d / body_len * speed_scale)
 
     avg_speed = median_filtered_mean(speeds)
 
@@ -1480,7 +1560,7 @@ def classify_action(history, frame_w, frame_h, kpts, scores, camera_motion_cache
         d = distance(front_paws[i - 1], front_paws[i])
 
         if d is not None:
-            front_speeds.append(d / body_len)
+            front_speeds.append(d / body_len * speed_scale)
 
     avg_front_speed = median_filtered_mean(front_speeds)
 
@@ -1688,6 +1768,7 @@ def make_action_video_live_camera_like(capture_source, mode):
                     frame_h,
                     camera_motion_cache,
                     prev_gray,
+                    fps=fps,
                 )
 
                 frame_id += 1
@@ -1785,6 +1866,7 @@ def run_batch_video_analysis(video_path):
             frame_h,
             camera_motion_cache,
             prev_gray,
+            fps=fps,
         )
 
         cv2.putText(frame, "Pet Behavior", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 255), 4)
