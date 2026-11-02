@@ -24,6 +24,7 @@
 | --- | --- |
 | `main_model.py` | 核心流程：DeepLabCut 推論、追蹤、行為分類、輸出標註影片與行為紀錄 |
 | `server.py` | FastAPI 伺服器，在背景執行緒啟動 `main_model.main()` |
+| `behavior_export.py` | 把行為區段整理成 App 資料表 `pet_behavior_logs` 的列格式，輸出到本機檔（dry-run）或上傳到 Supabase；也有 `list-pets` 指令查 `PET_ID` |
 | `check_accuracy.py` | 對單支影片跑 SuperAnimal 推論，檢查關鍵點品質（`input/test.mp4`） |
 | `check_accuracy_mypet.py` | 同上，改用自己的寵物影片 |
 | `requirements.txt` | 相依套件（鎖定版本） |
@@ -81,6 +82,43 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 | `VIDEO_PATH` | `input/dog_3.mp4` | `SOURCE_MODE=video` 時的影片路徑 |
 | `CLIP_DURATION_SECONDS` | `12` | 即時模式每段分析的秒數 |
 | `PROJECT_DIR` | 程式所在資料夾 | `input/`、`output/` 的根目錄 |
+| `BEHAVIOR_EXPORT` | 空（關閉） | `dryrun`：行為區段只寫本機檔；`supabase`：另外上傳到 Supabase；其他值（除了 `off`）會在載入時報錯 |
+| `PET_ID` | 空 | 這支攝影機對應的寵物 uuid，寫進輸出的 `pet_id`（`supabase` 模式必填）；格式不對會報錯 |
+| `EXPORT_MIN_SECONDS` | `0.5` | 比這短的行為區段不輸出（多半是剛追蹤到時第一個標籤一閃而過）；`0` 代表不過濾 |
+| `SUPABASE_URL`、`SUPABASE_ANON_KEY`、`SUPABASE_EMAIL`、`SUPABASE_PASSWORD` | 空 | 只有 `supabase` 模式需要，見下方「上傳到 Supabase」 |
+
+### 行為區段輸出（dry-run）
+
+只在即時模式有效。設 `BEHAVIOR_EXPORT=dryrun` 後，每分析完一段影片，就把「剛結束的行為區段」附加寫到 `output/behavior_export_dryrun.jsonl`，一行一筆，**不會連 Supabase**：
+
+```json
+{"id": "6f1c0a52-3b7e-4d0e-9a55-2f8c1e7b9d10", "pet_id": null, "start_seconds": 2.0, "end_seconds": 6.0, "behavior": "walking", "created_at": "2026-11-02T09:30:00+00:00", "_track_id": 1, "_session_started_at": "2026-11-02T09:25:12+00:00"}
+```
+
+- 前六個欄位對應 App 資料表 `pet_behavior_logs`；開頭是底線的欄位只是檢查用，不是資料表欄位。`id` 是本機先產生的 uuid，上傳重試時不變，才不會寫出重複的列。
+- `behavior` 是模型原始標籤（`lying`、`walking`、`running`、`standing`、`sitting`），不是 `/current` 對應後的 `resting`；`unknown`、`analyzing` 這類資料不足的暫時標籤、長度為 0 的區段，以及短於 `EXPORT_MIN_SECONDS` 的區段不輸出。
+- 進行中的區段要等結束才會輸出，程式收尾時會把最後一段補上。
+- `start_seconds` / `end_seconds` 是這次分析累積到的影片秒數（跟 `*_行為紀錄.txt` 同一套算法）：分析跟不上而被捨棄的片段不算，所以不等於實際時鐘時間；整個分析重新啟動（例如來源長時間中斷後 `server.py` 重試）會從 0 重算，`_session_started_at` 可用來區分。
+- 輸出失敗只會印警告，不影響行為分析。
+- 注意：App 的圓餅圖會一次抓這隻寵物的所有紀錄，Supabase 預設單次最多回 1000 筆，真正寫入前要先確認筆數與 App 端的查詢方式。
+
+### 上傳到 Supabase
+
+`BEHAVIOR_EXPORT=supabase` 會把同一批區段寫進 Supabase 的 `pet_behavior_logs`（App 的活動摘要圓餅圖、報表讀的就是這張表），本機 jsonl 照樣留一份。需要這些環境變數，缺任何一個會在載入時報錯（只列名稱，不印值）：
+
+| 變數 | 說明 |
+| --- | --- |
+| `SUPABASE_URL` | 專案網址，像 `https://xxxx.supabase.co`；一定要 https（只有 localhost 可以用 http） |
+| `SUPABASE_ANON_KEY` | 公開的 anon key，跟 App `.env` 的 `EXPO_PUBLIC_SUPABASE_ANON_KEY` 同一個 |
+| `SUPABASE_EMAIL`、`SUPABASE_PASSWORD` | **寵物擁有者**的 App 登入帳號。資料表的權限（RLS）只讓擁有者新增自己寵物的紀錄，所以不需要、也不要使用 service role key |
+| `PET_ID` | 這隻寵物的 uuid；不知道的話，設好前四個變數後執行 `venv\Scripts\python.exe behavior_export.py list-pets`，會列出這個帳號底下每隻寵物的 id 和名字 |
+
+這些值只放在環境變數，不要寫進程式、不要 commit、不要貼到聊天。
+
+- 啟動時會先登入並確認 `PET_ID` 真的是這個帳號的寵物，帳密錯或寵物不對會馬上印出原因並停用上傳（本機檔仍會留底）。
+- 上傳在背景執行緒進行，Supabase 慢或斷線不會拖慢分析。網路錯誤、429、5xx 會自動重試（間隔逐漸拉長）；權限被拒等 4xx 重試也不會好，直接丟掉並印出原因，丟掉的區段在本機檔裡還找得到。
+- 權限只有新增：App 端沒有修改權限，寫錯的資料只能刪除（擁有者有刪除權限）再重寫。
+- 要測試而不碰真的 Supabase，可以把 `SUPABASE_URL` 指到本機的假伺服器，`evaluation/test_behavior_export.py` 就是這樣測的。
 
 ## API
 

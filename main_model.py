@@ -12,6 +12,8 @@ from pathlib import Path
 from collections import deque, Counter
 from scipy.optimize import linear_sum_assignment
 
+import behavior_export
+
 import deeplabcut
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -172,6 +174,16 @@ CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 
 OUTPUT_DIR = PROJECT_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 行為區段輸出（BEHAVIOR_EXPORT=dryrun 只寫本機 jsonl；=supabase 另外上傳到 pet_behavior_logs；預設關閉）。
+# 打錯值、缺設定會在載入時就報錯，不會默默不輸出
+BEHAVIOR_EXPORT_MODE = behavior_export.read_export_mode()
+BEHAVIOR_EXPORT_PET_ID = behavior_export.read_pet_id()
+BEHAVIOR_EXPORT_MIN_SECONDS = behavior_export.read_min_seconds()
+BEHAVIOR_EXPORT_SUPABASE = (
+    behavior_export.read_supabase_settings() if BEHAVIOR_EXPORT_MODE == "supabase" else None
+)
+BEHAVIOR_EXPORT_PATH = OUTPUT_DIR / "behavior_export_dryrun.jsonl"
 
 video_path = Path(VIDEO_PATH)
 video_name = video_path.stem
@@ -1897,6 +1909,14 @@ def make_action_video_live_camera_like(capture_source, mode):
     prev_gray = None
     frame_id = 0
 
+    exporter = behavior_export.build_exporter(
+        BEHAVIOR_EXPORT_MODE,
+        BEHAVIOR_EXPORT_PATH,
+        pet_id=BEHAVIOR_EXPORT_PET_ID,
+        supabase=BEHAVIOR_EXPORT_SUPABASE,
+        min_seconds=BEHAVIOR_EXPORT_MIN_SECONDS,
+    )
+
     try:
         while True:
             clip_path = clip_queue.get()
@@ -1939,10 +1959,17 @@ def make_action_video_live_camera_like(capture_source, mode):
 
             update_latest_result(tracks)
 
+            if exporter is not None:
+                exporter.export_new(behavior_segments, fps)
+
             print(
                 f"分析完一段影片，累積到第 {frame_id} 幀，"
                 f"目前 tracks 數量 {len(tracks)}"
             )
+    except BaseException:
+        if exporter is not None:
+            exporter.close(timeout=0)   # 異常中斷時不要留著閒置的上傳執行緒
+        raise
     finally:
         stop_event.set()
         capture_thread.join(timeout=5.0)
@@ -1957,6 +1984,11 @@ def make_action_video_live_camera_like(capture_source, mode):
         runtime_source_label,
         BEHAVIOR_LOG_PATH
     )
+
+    # write_behavior_log 會把還在進行中的區段收進 behavior_segments，這裡一併輸出
+    if exporter is not None:
+        exporter.export_new(behavior_segments, fps)
+        exporter.close()   # 等上傳執行緒把佇列裡的送完（最多 10 秒）
 
 
 def run_batch_video_analysis(video_path):
