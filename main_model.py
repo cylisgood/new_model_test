@@ -14,6 +14,7 @@ from scipy.optimize import linear_sum_assignment
 
 import behavior_export
 import env_file
+import pet_identity
 
 import deeplabcut
 
@@ -184,8 +185,14 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BEHAVIOR_EXPORT_MODE = behavior_export.read_export_mode()
 BEHAVIOR_EXPORT_PET_ID = behavior_export.read_pet_id()
 BEHAVIOR_EXPORT_MIN_SECONDS = behavior_export.read_min_seconds()
+# PET_IDENTIFY=on：一支攝影機多隻寵物，每段行為依種類和外觀判斷是哪一隻（見 pet_identity.py）。
+# 開啟時 PET_ID 不再必填；要讀寵物清單和大頭照，所以 dryrun 模式也要有 SUPABASE_*
+PET_IDENTIFY = pet_identity.read_identify_mode()
+PET_IDENTIFY_PET_IDS = pet_identity.read_pet_ids()
 BEHAVIOR_EXPORT_SUPABASE = (
-    behavior_export.read_supabase_settings() if BEHAVIOR_EXPORT_MODE == "supabase" else None
+    behavior_export.read_supabase_settings(need_pet_id=not PET_IDENTIFY)
+    if BEHAVIOR_EXPORT_MODE == "supabase" or (PET_IDENTIFY and BEHAVIOR_EXPORT_MODE != "off")
+    else None
 )
 BEHAVIOR_EXPORT_PATH = OUTPUT_DIR / "behavior_export_dryrun.jsonl"
 
@@ -1013,12 +1020,17 @@ def process_behavior_frame(
     camera_motion_cache,
     prev_gray,
     fps=REFERENCE_FPS,
+    identifier=None,
 ):
     """
     把單一 frame 的 detection / tracking / 行為判斷流程集中處理。
     fps：影片 / 即時來源的幀率，行為判斷的時間視窗與速度門檻依它換算（見 REFERENCE_FPS）。
+    identifier：多寵物辨認（pet_identity.PetIdentifier），沒給就不取樣。
     """
     frame_actions = []
+
+    # 骨架和標籤會直接畫在 frame 上，辨認要看沒被畫過的原圖
+    clean_frame = frame.copy() if identifier is not None and identifier.will_sample(frame_id) else None
 
     for pet_id in tracks:
         tracks[pet_id]["missing_frames"] += 1
@@ -1067,6 +1079,9 @@ def process_behavior_frame(
 
         if not tracks[pet_id]["confirmed"]:
             continue
+
+        if clean_frame is not None:
+            identifier.observe(pet_id, frame_id, clean_frame, det["bbox"])
 
         raw_action = classify_action(
             tracks[pet_id]["history"],
@@ -1903,6 +1918,17 @@ def make_action_video_live_camera_like(capture_source, mode):
             stop_event.set()
             clip_queue.put(None)  # 通知分析執行緒可以結束了
 
+    # 要在開始錄影前建好：載入分類器、讀寵物清單失敗就直接停下來，
+    # 不能退回「全部記在同一隻」默默上傳錯的資料
+    identifier = None
+
+    if PET_IDENTIFY and BEHAVIOR_EXPORT_MODE != "off":
+        identifier = pet_identity.build_identifier(
+            behavior_export.SupabaseClient(BEHAVIOR_EXPORT_SUPABASE),
+            BEHAVIOR_EXPORT_SUPABASE,
+            pet_ids=PET_IDENTIFY_PET_IDS,
+        )
+
     capture_thread = threading.Thread(target=capture_and_clip_worker, daemon=True)
     capture_thread.start()
 
@@ -1919,6 +1945,7 @@ def make_action_video_live_camera_like(capture_source, mode):
         pet_id=BEHAVIOR_EXPORT_PET_ID,
         supabase=BEHAVIOR_EXPORT_SUPABASE,
         min_seconds=BEHAVIOR_EXPORT_MIN_SECONDS,
+        resolver=identifier.resolve if identifier is not None else None,
     )
 
     try:
@@ -1954,6 +1981,7 @@ def make_action_video_live_camera_like(capture_source, mode):
                     camera_motion_cache,
                     prev_gray,
                     fps=fps,
+                    identifier=identifier,
                 )
 
                 frame_id += 1

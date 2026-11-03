@@ -164,14 +164,18 @@ class DryRunExporter:
     還在進行中的區段（active_segments）不輸出，等它結束或程式收尾時才會進到 behavior_segments。
     """
 
-    def __init__(self, path, pet_id=None, clock=None, min_seconds=0.0):
+    def __init__(self, path, pet_id=None, clock=None, min_seconds=0.0, resolver=None):
         self.path = Path(path)
         self.pet_id = pet_id
         self.min_seconds = min_seconds
+        # resolver(track_id, segment) -> pet_identity.Decision；一支攝影機有多隻寵物時，
+        # 由它決定這段行為屬於哪隻寵物，沒給就全部記在 pet_id（舊行為）
+        self.resolver = resolver
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.session_started_at = self._now()
         self._exported = {}   # 追蹤編號 -> 已處理過幾個區段
         self.skipped = 0      # 不是真行為（unknown 等）或太短而略過的區段數
+        self.unidentified = 0  # 認不出是哪隻寵物、因此不上傳的區段數（本機 jsonl 仍有留底）
 
     def _now(self):
         return self._clock().isoformat(timespec="seconds")
@@ -187,9 +191,16 @@ class DryRunExporter:
         if end_seconds <= start_seconds or end_seconds - start_seconds < self.min_seconds:
             return None
 
-        return {
+        pet_id = self.pet_id
+        identity = None
+
+        if self.resolver is not None:
+            identity = self.resolver(track_id, segment)
+            pet_id = identity.pet_id
+
+        row = {
             "id": str(uuid.uuid4()),
-            "pet_id": self.pet_id,
+            "pet_id": pet_id,
             "start_seconds": round(start_seconds, 2),
             "end_seconds": round(end_seconds, 2),
             "behavior": segment["action"],
@@ -197,6 +208,11 @@ class DryRunExporter:
             "_track_id": track_id,
             "_session_started_at": self.session_started_at,
         }
+
+        if identity is not None:
+            row["_identity"] = {"reason": identity.reason, "scores": identity.scores, "samples": identity.samples}
+
+        return row
 
     def _append_file(self, rows):
         try:
@@ -242,6 +258,10 @@ class DryRunExporter:
 
         self._exported.update(cursors)
         self.skipped += skipped
+
+        if self.resolver is not None:
+            self.unidentified += sum(1 for row in rows if row["pet_id"] is None)
+
         return len(rows)
 
     def close(self, timeout=None):
@@ -353,6 +373,12 @@ class SupabaseClient:
 
     def list_pets(self):
         _, raw = self._call("GET", "/rest/v1/pets?select=id,name&order=created_at.asc", None, self._auth_headers())
+        return json.loads(raw)
+
+    def list_pets_with_avatars(self):
+        """寵物辨認用：多拿種類和大頭照網址。"""
+        query = "/rest/v1/pets?select=id,name,species,avatar_url&order=created_at.asc"
+        _, raw = self._call("GET", query, None, self._auth_headers())
         return json.loads(raw)
 
 
@@ -494,15 +520,24 @@ class SupabaseUploader:
 class SupabaseExporter(DryRunExporter):
     """本機 jsonl 照寫（留底），同時把同一批丟給背景上傳。"""
 
-    def __init__(self, path, uploader, pet_id, clock=None, min_seconds=0.0):
-        super().__init__(path, pet_id, clock=clock, min_seconds=min_seconds)
+    def __init__(self, path, uploader, pet_id, clock=None, min_seconds=0.0, resolver=None):
+        super().__init__(path, pet_id, clock=clock, min_seconds=min_seconds, resolver=resolver)
         self.uploader = uploader
 
     def _deliver(self, rows):
         self._append_file(rows)   # 留底寫不成也不擋上傳
 
+        # 認不出是哪隻寵物的不上傳（pet_id 是空的資料庫也不收），只留在本機 jsonl
+        uploadable = [row for row in rows if row["pet_id"] is not None]
+
+        if len(uploadable) < len(rows):
+            _log(f"🐾 {len(rows) - len(uploadable)} 段行為認不出是哪隻寵物，不上傳（本機留底）")
+
+        if not uploadable:
+            return True
+
         try:
-            self.uploader.submit(rows)
+            self.uploader.submit(uploadable)
         except Exception as e:
             _log(f"⚠️ [supabase] 交給上傳執行緒失敗（不影響分析）：{e!r}")
 
@@ -512,16 +547,16 @@ class SupabaseExporter(DryRunExporter):
         self.uploader.close(timeout)
 
 
-def build_exporter(mode, path, pet_id=None, supabase=None, min_seconds=0.0):
-    """依 BEHAVIOR_EXPORT 建立輸出器；off 回傳 None。"""
+def build_exporter(mode, path, pet_id=None, supabase=None, min_seconds=0.0, resolver=None):
+    """依 BEHAVIOR_EXPORT 建立輸出器；off 回傳 None。resolver 見 DryRunExporter。"""
     if mode == "dryrun":
         _log(f"📝 [dry-run] 行為區段會輸出到 {path}（不連 Supabase）")
-        return DryRunExporter(path, pet_id, min_seconds=min_seconds)
+        return DryRunExporter(path, pet_id, min_seconds=min_seconds, resolver=resolver)
 
     if mode == "supabase":
         uploader = SupabaseUploader(SupabaseClient(supabase))
         _log(f"☁️ [supabase] 行為區段會寫入 {TABLE}，並在本機保留一份 {path}")
-        return SupabaseExporter(path, uploader, supabase.pet_id, min_seconds=min_seconds)
+        return SupabaseExporter(path, uploader, supabase.pet_id, min_seconds=min_seconds, resolver=resolver)
 
     return None
 

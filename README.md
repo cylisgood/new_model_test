@@ -138,6 +138,25 @@ notepad $env:USERPROFILE\.petbehavior\.env
 - 權限只有新增：App 端沒有修改權限，寫錯的資料只能刪除（擁有者有刪除權限）再重寫。
 - 要測試而不碰真的 Supabase，可以把 `SUPABASE_URL` 指到本機的假伺服器，`evaluation/test_behavior_export.py` 就是這樣測的。
 
+### 一支攝影機多隻寵物（寵物辨認）
+
+預設所有行為都記在 `PET_ID` 這一隻。設 `PET_IDENTIFY=on` 後，每段行為會依「種類 + 外觀」判斷是帳號底下的哪一隻，再寫進那隻的 `pet_id`（`pet_identity.py`）：
+
+1. 種類：用 torchvision MobileNetV3 的 ImageNet 權重看裁切圖是狗還是貓，跟寵物資料的 `species` 不同的直接排除（第一次使用會下載約 21 MB 到 torch 快取）。
+2. 外觀：同種類有多隻時，拿 App 裡的大頭照（`avatar_url`）當參考，比對分類器特徵和顏色直方圖。
+3. 信心門檻：最像的要夠像，而且跟第二像差距要夠大，否則「認不出」，**不上傳**，只留在本機 jsonl（`_identity` 欄位記原因和分數）。
+
+| 變數 | 說明 |
+| --- | --- |
+| `PET_IDENTIFY` | `on` 開啟；預設關閉。開啟時 `PET_ID` 不必填，且 dryrun 模式也需要 `SUPABASE_*`（要讀寵物清單和大頭照） |
+| `PET_IDS` | 只比對這幾隻（逗號分隔 uuid）；不設就是帳號底下全部 |
+| `PET_ID_MIN_SCORE`、`PET_ID_MIN_MARGIN` | 外觀分數門檻（預設 0.55）與第一、二名最小差距（預設 0.08） |
+| `PET_ID_SAMPLE_EVERY` | 每幾幀取樣一次（預設 4） |
+
+- 載入分類器或讀寵物清單失敗會直接停止啟動，不會退回「全部記在同一隻」。
+- 每隻寵物最好有種類和清楚的大頭照；同種類又沒有大頭照的寵物，那個種類的行為會因缺參考而認不出。
+- 預設門檻**還沒用真實的多寵物影片校正過**。用 `evaluation/identity_check.py` 對一段影片跑完整流程，看每段的分數和認對、認錯、認不出的比例，再調門檻（說明見檔案開頭）。
+
 ## API
 
 | 方法 | 路徑 | 說明 |
