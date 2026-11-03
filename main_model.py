@@ -13,11 +13,15 @@ from collections import deque, Counter
 from scipy.optimize import linear_sum_assignment
 
 import behavior_export
+import env_file
 
 import deeplabcut
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# 先把設定檔（.env）讀進環境變數，後面所有讀環境變數的設定才讀得到；真正的環境變數優先，見 env_file.py
+env_file.load_env_files()
 
 # ============================================================
 # 給 server.py /current、/ws 讀取的即時行為結果

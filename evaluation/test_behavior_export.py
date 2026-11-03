@@ -11,6 +11,7 @@ Supabase 用本機假伺服器（127.0.0.1，隨機 port）代替，不會連到
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -22,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("SKIP_ENV_FILE", "1")   # 測試不要讀這台電腦上真正的 .env（見 env_file.py）
 import behavior_export as be  # noqa: E402
 
 PET_UUID = "123e4567-e89b-12d3-a456-426614174000"

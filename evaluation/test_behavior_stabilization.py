@@ -6,11 +6,13 @@
   venv\\Scripts\\python.exe evaluation\\test_behavior_stabilization.py
 """
 
+import os
 import sys
 from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("SKIP_ENV_FILE", "1")   # 測試不要讀這台電腦上真正的 .env（見 env_file.py）
 import main_model as mm  # noqa: E402  (會載入 deeplabcut，要幾秒)
 
 

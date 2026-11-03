@@ -123,6 +123,7 @@ def main():
     env.pop("RTSP_URL", None)
     env["HUB_AI_STREAM"] = f"http://127.0.0.1:{FAKE_PORT}/video"
     env["CLIP_DURATION_SECONDS"] = "5"
+    env["SKIP_ENV_FILE"] = "1"                        # 不要讓這台電腦上真正的 .env（例如開了 Supabase 上傳）影響測試
     env["PYTHONIOENCODING"] = "utf-8"
 
     fake = start_fake(fake_log_file)

@@ -562,4 +562,7 @@ def main(argv=None, env=None):
 
 
 if __name__ == "__main__":
+    import env_file
+
+    env_file.load_env_files()   # 讓 list-pets 也吃得到 .env，不用另外設環境變數
     sys.exit(main())

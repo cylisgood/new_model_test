@@ -25,6 +25,8 @@
 | `main_model.py` | 核心流程：DeepLabCut 推論、追蹤、行為分類、輸出標註影片與行為紀錄 |
 | `server.py` | FastAPI 伺服器，在背景執行緒啟動 `main_model.main()` |
 | `behavior_export.py` | 把行為區段整理成 App 資料表 `pet_behavior_logs` 的列格式，輸出到本機檔（dry-run）或上傳到 Supabase；也有 `list-pets` 指令查 `PET_ID` |
+| `env_file.py` | 啟動時把 `.env` 設定檔讀進環境變數，見下方「設定檔」 |
+| `.env.example` | 設定檔範本，只有欄位名稱，不含任何真實的值 |
 | `check_accuracy.py` | 對單支影片跑 SuperAnimal 推論，檢查關鍵點品質（`input/test.mp4`） |
 | `check_accuracy_mypet.py` | 同上，改用自己的寵物影片 |
 | `requirements.txt` | 相依套件（鎖定版本） |
@@ -87,6 +89,22 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 | `EXPORT_MIN_SECONDS` | `0.5` | 比這短的行為區段不輸出（多半是剛追蹤到時第一個標籤一閃而過）；`0` 代表不過濾 |
 | `SUPABASE_URL`、`SUPABASE_ANON_KEY`、`SUPABASE_EMAIL`、`SUPABASE_PASSWORD` | 空 | 只有 `supabase` 模式需要，見下方「上傳到 Supabase」 |
 
+### 設定檔（.env）
+
+不想每次開終端機都重設環境變數，可以把上面的變數寫進設定檔，程式啟動時會自動讀進來（`main_model.py` 載入時就會讀，所以 `python main_model.py`、`uvicorn server:app`、`behavior_export.py list-pets` 都一樣）。複製範本再填入實際的值：
+
+```powershell
+mkdir $env:USERPROFILE\.petbehavior
+copy .env.example $env:USERPROFILE\.petbehavior\.env
+notepad $env:USERPROFILE\.petbehavior\.env
+```
+
+- 一行一個 `名稱=值`；`#` 開頭是註解；值前後成對的引號會拿掉；**不支援行尾註解**（密碼裡可能有 `#`）；檔案要存成 UTF-8。
+- 優先順序（前面的優先）：**真正的環境變數** → `ENV_FILE` 環境變數指定的檔案 → `%USERPROFILE%\.petbehavior\.env` → 專案資料夾的 `.env`。檔案只會補上「還沒設定」的變數，蓋不過真正的環境變數；值是空的行視為沒設定。
+- **密碼建議放在 `%USERPROFILE%\.petbehavior\.env`，不要放在專案資料夾**：`.gitignore` 只擋得了 git，專案資料夾若在 OneDrive 底下，檔案仍會被同步到雲端。程式發現含密碼的設定檔在 OneDrive 裡，啟動時會印出警告。
+- 啟動時只印出讀到哪個檔案、設定了哪些變數的名稱，不會印出值；格式不對的行只報行號。
+- `SKIP_ENV_FILE=1` 可以整個不讀設定檔（測試用，`evaluation/` 底下會載入 `main_model` 的測試都會這樣設）。
+
 ### 行為區段輸出（dry-run）
 
 只在即時模式有效。設 `BEHAVIOR_EXPORT=dryrun` 後，每分析完一段影片，就把「剛結束的行為區段」附加寫到 `output/behavior_export_dryrun.jsonl`，一行一筆，**不會連 Supabase**：
@@ -113,7 +131,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 | `SUPABASE_EMAIL`、`SUPABASE_PASSWORD` | **寵物擁有者**的 App 登入帳號。資料表的權限（RLS）只讓擁有者新增自己寵物的紀錄，所以不需要、也不要使用 service role key |
 | `PET_ID` | 這隻寵物的 uuid；不知道的話，設好前四個變數後執行 `venv\Scripts\python.exe behavior_export.py list-pets`，會列出這個帳號底下每隻寵物的 id 和名字 |
 
-這些值只放在環境變數，不要寫進程式、不要 commit、不要貼到聊天。
+這些值只放在環境變數或設定檔（見上方「設定檔」），不要寫進程式、不要 commit、不要貼到聊天。
 
 - 啟動時會先登入並確認 `PET_ID` 真的是這個帳號的寵物，帳密錯或寵物不對會馬上印出原因並停用上傳（本機檔仍會留底）。
 - 上傳在背景執行緒進行，Supabase 慢或斷線不會拖慢分析。網路錯誤、429、5xx 會自動重試（間隔逐漸拉長）；權限被拒等 4xx 重試也不會好，直接丟掉並印出原因，丟掉的區段在本機檔裡還找得到。
