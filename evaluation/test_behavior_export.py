@@ -547,6 +547,60 @@ def test_works_with_real_segment_builder():
         assert rows[2]["start_seconds"] == 2.0 and rows[2]["end_seconds"] == 2.97
 
 
+def test_identify_mode_ignores_stale_pet_id_and_still_uploads():
+    """換了帳號、設定檔還留著舊帳號的 PET_ID：不需要 PET_ID 的場合（開了寵物辨認）不能因此停用上傳。"""
+    stale_pet_id = str(uuid.uuid4())     # 別的帳號的寵物，這個帳號底下查不到
+    stub = StubSupabase()
+
+    try:
+        env = {
+            "SUPABASE_URL": stub.url, "SUPABASE_ANON_KEY": ANON_KEY,
+            "SUPABASE_EMAIL": OWNER_EMAIL, "SUPABASE_PASSWORD": OWNER_PASSWORD,
+            "PET_ID": stale_pet_id,
+        }
+        settings = be.read_supabase_settings(env, need_pet_id=False)
+        assert settings.pet_id is None
+
+        # 連格式不對的舊值也不能讓設定讀取失敗
+        assert be.read_supabase_settings({**env, "PET_ID": "not-a-uuid"}, need_pet_id=False).pet_id is None
+
+        client = be.SupabaseClient(settings, opener=urllib.request.build_opener(urllib.request.ProxyHandler({})))
+        logs = []
+        uploader = be.SupabaseUploader(client, backoff=(0.01,), log=logs.append)
+
+        try:
+            assert uploader.submit(sample_rows(2)) is True
+            wait_until(lambda: uploader.uploaded == 2, what="兩筆上傳完成")
+            assert not uploader.disabled
+            assert not any("已停用" in message for message in logs), logs
+            assert not any("/rest/v1/pets" in r[1] for r in stub.requests), "沒有 PET_ID 就不該去查寵物"
+        finally:
+            uploader.close(timeout=3)
+    finally:
+        stub.stop()
+
+
+def test_pet_id_still_required_when_not_identifying():
+    """沒開寵物辨認時行為不變：PET_ID 照樣必填，也照樣檢查是不是這個帳號的寵物。"""
+    good = {
+        "SUPABASE_URL": "https://abc.supabase.co", "SUPABASE_ANON_KEY": ANON_KEY,
+        "SUPABASE_EMAIL": OWNER_EMAIL, "SUPABASE_PASSWORD": OWNER_PASSWORD,
+    }
+
+    try:
+        be.read_supabase_settings(good)
+    except ValueError as e:
+        assert "PET_ID" in str(e)
+    else:
+        raise AssertionError("沒開辨認時缺 PET_ID 要報錯")
+
+    assert be.read_supabase_settings({**good, "PET_ID": PET_UUID}).pet_id == PET_UUID
+
+    with rig(lambda s: setattr(s, "pets", [])) as (stub, uploader, logs):
+        wait_until(lambda: uploader.disabled, what="PET_ID 不是這個帳號的寵物就停用")
+        assert any("PET_ID 不是這個帳號底下的寵物" in message for message in logs)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

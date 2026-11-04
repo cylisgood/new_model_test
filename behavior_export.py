@@ -116,7 +116,9 @@ def read_supabase_settings(env=None, need_pet_id=True):
     env = os.environ if env is None else env
     values = {name: env.get(name, "").strip() for name in SUPABASE_ENV_NAMES}
     missing = [name for name, value in values.items() if not value]
-    pet_id = read_pet_id(env)
+    # 不需要 PET_ID 的場合（只查寵物清單、或開了寵物辨認由辨認器決定寫給哪一隻）完全不看它：
+    # 設定檔裡可能留著別的帳號的舊值，上傳器啟動時拿它去檢查會查不到，整個停用上傳
+    pet_id = read_pet_id(env) if need_pet_id else None
 
     if need_pet_id and pet_id is None:
         missing.append("PET_ID")

@@ -183,12 +183,13 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 行為區段輸出（BEHAVIOR_EXPORT=dryrun 只寫本機 jsonl；=supabase 另外上傳到 pet_behavior_logs；預設關閉）。
 # 打錯值、缺設定會在載入時就報錯，不會默默不輸出
 BEHAVIOR_EXPORT_MODE = behavior_export.read_export_mode()
-BEHAVIOR_EXPORT_PET_ID = behavior_export.read_pet_id()
-BEHAVIOR_EXPORT_MIN_SECONDS = behavior_export.read_min_seconds()
 # PET_IDENTIFY=on：一支攝影機多隻寵物，每段行為依種類和外觀判斷是哪一隻（見 pet_identity.py）。
-# 開啟時 PET_ID 不再必填；要讀寵物清單和大頭照，所以 dryrun 模式也要有 SUPABASE_*
+# 開啟時完全不看 PET_ID（設定檔裡可能還留著別的帳號的舊值，不能因此讓上傳整個停用）；
+# 要讀寵物清單和大頭照，所以 dryrun 模式也要有 SUPABASE_*
 PET_IDENTIFY = pet_identity.read_identify_mode()
 PET_IDENTIFY_PET_IDS = pet_identity.read_pet_ids()
+BEHAVIOR_EXPORT_PET_ID = None if PET_IDENTIFY else behavior_export.read_pet_id()
+BEHAVIOR_EXPORT_MIN_SECONDS = behavior_export.read_min_seconds()
 BEHAVIOR_EXPORT_SUPABASE = (
     behavior_export.read_supabase_settings(need_pet_id=not PET_IDENTIFY)
     if BEHAVIOR_EXPORT_MODE == "supabase" or (PET_IDENTIFY and BEHAVIOR_EXPORT_MODE != "off")
