@@ -404,6 +404,7 @@ LEFT_FRONT_PAW_IDX = KEYPOINTS.index("front_left_paw")
 RIGHT_FRONT_PAW_IDX = KEYPOINTS.index("front_right_paw")
 LEFT_BACK_PAW_IDX = KEYPOINTS.index("back_left_paw")
 RIGHT_BACK_PAW_IDX = KEYPOINTS.index("back_right_paw")
+BACK_MIDDLE_IDX = KEYPOINTS.index("back_middle")
 
 # 實測 SuperAnimal-Quadruped 的 neck_base / neck_end / back_base 只有約 68% 的幀信心度夠，
 # 且位置會在肩頸之間跳動；身體中心改用這幾個 94% 以上都穩定有效的軀幹點取平均。
@@ -431,6 +432,10 @@ MIN_VALID_KEYPOINTS = 16       # 有效關鍵點少於這個數量（約 40%）�
 DUPLICATE_IOU_THRES = 0.5      # 同一幀兩個偵測框重疊超過這個比例，視為同一隻，只留關鍵點較多的
 TRACK_MIN_HITS = 5             # 新出現的追蹤要連續被配對到幾幀才算數，之後才會顯示 / 記錄行為
 TENTATIVE_MAX_MISSING = 3      # 還沒確認的追蹤，超過幾幀沒配對到就丟掉
+# 上面兩個「幀數」是在高幀率（約 30 FPS）調的；分析幀率降低（ANALYSIS_FPS）時，
+# 同樣的幀數會變成好幾秒，所以追蹤確認、消失保留改成以秒計，再換算成幀數（見 track_min_hits / max_missing_frames）
+TRACK_CONFIRM_SECONDS = 0.7    # 新追蹤最多等這麼久就確認（高幀率時仍以 TRACK_MIN_HITS 幀為準）
+MAX_MISSING_SECONDS = 3.0      # 寵物消失這麼久內仍保留原 ID（高幀率時等於 MAX_MISSING_FRAMES）
 
 # --- 新增：外觀(顏色)特徵權重與 bbox 相關參數 ---
 COLOR_HIST_BINS = 16          # HSV 色調直方圖的 bin 數
@@ -446,6 +451,15 @@ W_COLOR = 0.35
 # 坐姿要求後腳收起來：髖部到後腳掌的垂直距離 ÷ 身長。
 # 實測坐著的貓 0.27~0.39，站著/踱步/正面走路都在 0.52 以上，取中間空隙 0.45。
 SITTING_MAX_HIP_TO_BACK_PAW = 0.45
+
+# 趴臥：看「腳掌離背部有多遠」（四隻腳掌平均高度 − 背部中點高度，÷身長）和外框的高寬比。
+# 舊規則只看脊椎是否水平，但四隻腳站著的動物從側面看脊椎本來就是水平的，會把站著的狗判成趴臥。
+# 門檻用人工標的 233 筆站、坐、趴樣本（狗、幼犬、貓，13 支影片）挑的，單張判斷時留一支影片驗證整體 80%（舊規則 64%）；
+# 站著的腳掌離背部約 0.9，趴著約 0.5，中間有重疊，而且斜前方拍趴著的狗時這個值會變成 0.9 以上（看起來像站著），
+# 所以不是百分之百，換新場景建議再用實際畫面檢查
+LYING_MAX_PAW_DROP = 0.65
+LYING_MAX_BBOX_ASPECT = 0.9      # 外框高 ÷ 寬，趴著通常比較扁
+LYING_FALLBACK_ASPECT = 0.7      # 腳掌看不到、算不出腳掌距離時，只用外框高寬比判斷
 
 # --- 新增：行為判斷相關參數 ---
 PATH_EFFICIENCY_THRES = 0.35  # 淨位移 / 總路徑長，低於此值視為「原地抖動」而非真的移動
@@ -533,6 +547,33 @@ def update_behavior_segments(behavior_segments, active_segments, pet_id, action,
 
 def seconds_to_frames(seconds, fps, minimum=1):
     return max(minimum, int(round(seconds * fps)))
+
+
+def track_min_hits(fps):
+    """新追蹤要連續配對到幾幀才確認：高幀率用 TRACK_MIN_HITS，低幀率縮短，至少 2 幀。"""
+    return max(2, min(TRACK_MIN_HITS, int(round(TRACK_CONFIRM_SECONDS * fps))))
+
+
+def history_frames(fps):
+    """
+    追蹤歷史保留幾幀（用來算速度、姿勢中位數）：約 HISTORY_SECONDS 秒，高幀率至少 8 幀（維持原本）。
+    低幀率下限降到 4 幀：不然 3 張／秒時歷史會被撐成 2.7 秒，動物停下來之後還在拿之前的速度判斷，
+    奔跑結束後好幾秒仍被判成跑。
+    """
+    return seconds_to_frames(HISTORY_SECONDS, fps, 8 if fps >= 8 else 4)
+
+
+def ema_alpha(fps):
+    """
+    位置平滑係數：原本在 30 FPS 調的每幀 0.4；10 FPS 以下相鄰兩幀隔得久，要換算成同樣的時間常數，
+    不然平滑會變成落後好幾秒、把真正的位移吃掉。
+    """
+    return 0.4 if fps >= 10 else min(1.0, 1 - (1 - 0.4) ** (10.0 / fps))
+
+
+def max_missing_frames(fps):
+    """寵物消失幾幀內仍保留原 ID：約 MAX_MISSING_SECONDS 秒，高幀率時不超過 MAX_MISSING_FRAMES。"""
+    return max(TENTATIVE_MAX_MISSING, min(MAX_MISSING_FRAMES, int(round(MAX_MISSING_SECONDS * fps))))
 
 
 def stabilize_action(track, frame_id, fps):
@@ -947,6 +988,7 @@ def run_dlc_clip_inference(clip_path):
         model_name=DLC_MODEL_NAME,
         detector_name=DLC_DETECTOR_NAME,
         video_adapt=False,
+        create_labeled_video=False,   # 標註影片這裡用不到，每段會多花約 2 秒
     )
 
     json_candidates = list(clip_path.parent.glob(f"{clip_path.stem}_{DLC_SUPERANIMAL_NAME}_*_before_adapt.json"))
@@ -1126,7 +1168,7 @@ def process_behavior_frame(
 
     dead_ids = [
         pet_id for pet_id, track in tracks.items()
-        if track["missing_frames"] > (MAX_MISSING_FRAMES if track["confirmed"] else TENTATIVE_MAX_MISSING)
+        if track["missing_frames"] > (track.get("max_missing", MAX_MISSING_FRAMES) if track["confirmed"] else TENTATIVE_MAX_MISSING)
     ]
 
     for pet_id in dead_ids:
@@ -1232,6 +1274,31 @@ def hip_to_back_paw_ratio(kpts, scores, body_len):
     return (back_paw[1] - hip[1]) / body_len
 
 
+def paw_drop_ratio(kpts, scores, body_len):
+    """四隻腳掌的平均高度比背部中點低多少（÷身長）。站著約 0.9、坐著的貓約 0.9、趴著約 0.5。"""
+    if body_len is None or body_len < 1:
+        return None
+
+    back = get_point(kpts, scores, BACK_MIDDLE_IDX)
+    paws = [get_point(kpts, scores, i) for i in (
+        LEFT_FRONT_PAW_IDX, RIGHT_FRONT_PAW_IDX, LEFT_BACK_PAW_IDX, RIGHT_BACK_PAW_IDX)]
+    paws = [p for p in paws if p is not None]
+
+    if back is None or not paws:
+        return None
+
+    return (sum(p[1] for p in paws) / len(paws) - back[1]) / body_len
+
+
+def bbox_aspect_ratio(bbox):
+    """外框高 ÷ 寬。"""
+    if bbox is None:
+        return None
+
+    x1, y1, x2, y2 = bbox
+    return (y2 - y1) / max(1.0, (x2 - x1))
+
+
 def get_smoothed_posture_features(hist_list, kpts, scores, body_len):
     """
     脊椎角度單幀會因為關鍵點抖動，在 sitting/standing 的門檻附近來回跳，
@@ -1260,14 +1327,30 @@ def get_smoothed_posture_features(hist_list, kpts, scores, body_len):
     if leg_ratios:
         features["hip_to_back_paw"] = float(np.median(leg_ratios))
 
+    paw_drops = [h["paw_drop"] for h in hist_list if h.get("paw_drop") is not None]
+
+    if paw_drops:
+        features["paw_drop"] = float(np.median(paw_drops))
+
+    aspects = [h["bbox_aspect"] for h in hist_list if h.get("bbox_aspect") is not None]
+
+    if aspects:
+        features["bbox_aspect"] = float(np.median(aspects))
+
     return features
 
 
 def classify_static_posture(features):
     spine_vr = features.get("spine_vertical_ratio", None)
     hip_to_paw = features.get("hip_to_back_paw", None)
+    paw_drop = features.get("paw_drop", None)
+    aspect = features.get("bbox_aspect", None)
 
-    if spine_vr is not None and spine_vr < 0.25:
+    # 趴臥：腳掌離背部近、外框偏扁。不能只看脊椎水平，站著的動物側面看脊椎也是水平的
+    if paw_drop is not None:
+        if paw_drop < LYING_MAX_PAW_DROP and (aspect is None or aspect < LYING_MAX_BBOX_ASPECT):
+            return "lying"
+    elif aspect is not None and aspect < LYING_FALLBACK_ASPECT:
         return "lying"
 
     if spine_vr is not None and spine_vr > 0.45:
@@ -1338,6 +1421,8 @@ def extract_detection_features(kpts, scores, raw_bbox, frame, frame_w, frame_h):
         "front_paw": front_paw,
         "back_paw": back_paw,
         "hip_to_back_paw": hip_to_back_paw_ratio(kpts, scores, body_len),
+        "paw_drop": paw_drop_ratio(kpts, scores, body_len),
+        "bbox_aspect": bbox_aspect_ratio(bbox),
         "features": features
     }
 
@@ -1420,7 +1505,7 @@ def compute_match_score(det, track):
 
 
 def create_new_track(det, frame_id, fps=REFERENCE_FPS):
-    history = deque(maxlen=seconds_to_frames(HISTORY_SECONDS, fps, 8))
+    history = deque(maxlen=history_frames(fps))
     action_history = deque(maxlen=seconds_to_frames(ACTION_VOTE_SECONDS, fps, 3))
 
     history.append({
@@ -1431,6 +1516,8 @@ def create_new_track(det, frame_id, fps=REFERENCE_FPS):
         "front_paw": det["front_paw"],
         "back_paw": det["back_paw"],
         "hip_to_back_paw": det.get("hip_to_back_paw"),
+        "paw_drop": det.get("paw_drop"),
+        "bbox_aspect": det.get("bbox_aspect"),
         "frame_id": frame_id
     })
 
@@ -1449,7 +1536,10 @@ def create_new_track(det, frame_id, fps=REFERENCE_FPS):
         "missing_frames": 0,
         "active": True,
         "hits": 1,
-        "confirmed": TRACK_MIN_HITS <= 1,
+        "min_hits": track_min_hits(fps),
+        "max_missing": max_missing_frames(fps),
+        "ema_alpha": ema_alpha(fps),
+        "confirmed": track_min_hits(fps) <= 1,
 
         # 最終輸出的行為與去抖動狀態（見 stabilize_action）
         "current_action": None,
@@ -1483,13 +1573,13 @@ def update_track(track, det, frame_id):
     track["missing_frames"] = 0
 
     track["hits"] = track.get("hits", 0) + 1
-    if track["hits"] >= TRACK_MIN_HITS:
+    if track["hits"] >= track.get("min_hits", TRACK_MIN_HITS):
         track["confirmed"] = True
 
     track["ema_center"] = update_ema_center(
         new_center,
         track.get("ema_center"),
-        alpha=0.4
+        alpha=track.get("ema_alpha", 0.4)
     )
 
     track["history"].append({
@@ -1500,6 +1590,8 @@ def update_track(track, det, frame_id):
         "front_paw": det["front_paw"],
         "back_paw": det["back_paw"],
         "hip_to_back_paw": det.get("hip_to_back_paw"),
+        "paw_drop": det.get("paw_drop"),
+        "bbox_aspect": det.get("bbox_aspect"),
         "frame_id": frame_id
     })
 
@@ -1514,7 +1606,7 @@ def match_detections_to_tracks(detections, tracks):
     """
     valid_track_ids = [
         pid for pid, t in tracks.items()
-        if t["missing_frames"] <= MAX_MISSING_FRAMES
+        if t["missing_frames"] <= t.get("max_missing", MAX_MISSING_FRAMES)
     ]
 
     n_det = len(detections)
@@ -1796,6 +1888,38 @@ def draw_pose(frame, kpts, scores, color=(255, 0, 0)):
 
 CLIP_DURATION_SECONDS = float(os.getenv("CLIP_DURATION_SECONDS", "12"))
 
+# 每秒只取幾張畫面進行分析，其餘丟掉（即時影像 /video_feed 不受影響）。
+# 攝影機約 20 張／秒，但偵測加姿態每秒只處理得了約 3 到 8 張，每張都分析會越積越多、約三分之二的時間沒被分析到；
+# 趴臥、坐、站不需要每張都看，走和跑用 1 到 2 秒內的移動距離就夠。0 = 每一張都分析（舊行為）
+ANALYSIS_FPS = float(os.getenv("ANALYSIS_FPS", "3"))
+
+
+class FrameSampler:
+    """依時間挑畫面：每 interval 秒取 1 張，其餘丟掉；interval <= 0 代表每一張都取。"""
+
+    def __init__(self, interval, clock=time.monotonic):
+        self.interval = interval
+        self._clock = clock
+        self._next = None
+
+    def take(self):
+        if self.interval <= 0:
+            return True
+
+        now = self._clock()
+
+        if self._next is None or now >= self._next - 1e-9:
+            # 下一張的時間是「排定時間」加間隔，不是「實際取到的時間」加間隔，這樣畫面抵達時間的抖動不會讓整體頻率跑掉；
+            # 落後超過一個間隔（例如斷線之後）就從現在重新排
+            nxt = (self._next if self._next is not None else now) + self.interval
+            self._next = nxt if nxt > now else now + self.interval
+            return True
+
+        return False
+
+    def reset(self):
+        self._next = None
+
 
 def make_action_video_live_camera_like(capture_source, mode):
     """
@@ -1839,13 +1963,24 @@ def make_action_video_live_camera_like(capture_source, mode):
     frame_h, frame_w = frame.shape[:2]
     set_source_connected(True)
 
+    # 分析用的幀率：低於來源幀率才需要抽樣；行為判斷的所有以秒計的視窗和速度門檻都依這個幀率換算
+    if 0 < ANALYSIS_FPS < fps:
+        analysis_fps = ANALYSIS_FPS
+        sampler = FrameSampler(1.0 / analysis_fps)
+        analysis_note = f"每秒取 {analysis_fps:g} 張分析（來源 {fps:.1f} 張／秒，其餘畫面只用來顯示）"
+    else:
+        analysis_fps = fps
+        sampler = FrameSampler(0)
+        analysis_note = "每一張都分析"
+
     print("即時來源解析度：", frame_w, "x", frame_h)
     print("FPS：", fps_note)
+    print("分析取樣：", analysis_note)
     print("每段分析長度：", CLIP_DURATION_SECONDS, "秒")
 
     stop_event = threading.Event()
     clip_queue = queue.Queue(maxsize=2)  # 分析跟不上時，寧可丟掉舊片段也不要延遲越積越大
-    frames_per_clip = max(1, int(round(fps * CLIP_DURATION_SECONDS)))
+    frames_per_clip = max(1, int(round(analysis_fps * CLIP_DURATION_SECONDS)))
 
     def capture_and_clip_worker():
         nonlocal frame, cap
@@ -1877,6 +2012,7 @@ def make_action_video_live_camera_like(capture_source, mode):
                     if new_cap is None:
                         break
 
+                    sampler.reset()
                     cap, frame = new_cap, new_frame
                     set_source_connected(True)
                     print(f"✅ 即時來源已恢復（中斷約 {time.time() - lost_at:.0f} 秒）")
@@ -1888,16 +2024,19 @@ def make_action_video_live_camera_like(capture_source, mode):
 
                 update_latest_frame(frame)
 
-                if writer is None:
+                take_frame = sampler.take()
+
+                if take_frame and writer is None:
                     clip_path = OUTPUT_DIR / f"_live_clip_{clip_index}.mp4"
                     writer = cv2.VideoWriter(
-                        str(clip_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_w, frame_h)
+                        str(clip_path), cv2.VideoWriter_fourcc(*"mp4v"), analysis_fps, (frame_w, frame_h)
                     )
 
-                writer.write(frame)
-                frame_count_in_clip += 1
+                if take_frame:
+                    writer.write(frame)
+                    frame_count_in_clip += 1
 
-                if frame_count_in_clip >= frames_per_clip:
+                if take_frame and frame_count_in_clip >= frames_per_clip:
                     writer.release()
                     writer = None
                     frame_count_in_clip = 0
@@ -1923,10 +2062,16 @@ def make_action_video_live_camera_like(capture_source, mode):
     identifier = None
 
     if PET_IDENTIFY and BEHAVIOR_EXPORT_MODE != "off":
+        min_score, min_margin, sample_every = pet_identity.read_thresholds()
+
+        if analysis_fps < 8:
+            sample_every = 1   # 分析幀率低時每一張都取樣，否則一段行為裡的樣本太少
+
         identifier = pet_identity.build_identifier(
             behavior_export.SupabaseClient(BEHAVIOR_EXPORT_SUPABASE),
             BEHAVIOR_EXPORT_SUPABASE,
             pet_ids=PET_IDENTIFY_PET_IDS,
+            thresholds=(min_score, min_margin, sample_every),
         )
 
     capture_thread = threading.Thread(target=capture_and_clip_worker, daemon=True)
@@ -1980,7 +2125,7 @@ def make_action_video_live_camera_like(capture_source, mode):
                     frame_h,
                     camera_motion_cache,
                     prev_gray,
-                    fps=fps,
+                    fps=analysis_fps,
                     identifier=identifier,
                 )
 
@@ -1992,7 +2137,7 @@ def make_action_video_live_camera_like(capture_source, mode):
             update_latest_result(tracks)
 
             if exporter is not None:
-                exporter.export_new(behavior_segments, fps)
+                exporter.export_new(behavior_segments, analysis_fps)
 
             print(
                 f"分析完一段影片，累積到第 {frame_id} 幀，"
@@ -2012,14 +2157,14 @@ def make_action_video_live_camera_like(capture_source, mode):
     write_behavior_log(
         behavior_segments,
         active_segments,
-        fps,
+        analysis_fps,
         runtime_source_label,
         BEHAVIOR_LOG_PATH
     )
 
     # write_behavior_log 會把還在進行中的區段收進 behavior_segments，這裡一併輸出
     if exporter is not None:
-        exporter.export_new(behavior_segments, fps)
+        exporter.export_new(behavior_segments, analysis_fps)
         exporter.close()   # 等上傳執行緒把佇列裡的送完（最多 10 秒）
 
 

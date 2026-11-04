@@ -74,6 +74,12 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 即時模式下，程式會持續錄影並每 `CLIP_DURATION_SECONDS` 秒（預設 12）切成一段，依序交給 DeepLabCut 分析。原因是 SuperAnimal-Quadruped 只提供整支影片的批次介面，沒有穩定的單幀即時推論。所以 `/video_feed` 是即時的，`/current` 與 `/ws` 的行為結果則是「約 N 秒前發生的事」。
 
+**分析取樣（`ANALYSIS_FPS`）**：攝影機約 20 張／秒，但偵測加姿態每張要花約 0.13 秒（一隻動物）到 0.25 秒以上（兩隻、或 4K），每張都分析會越積越多、大部分時間沒被分析到（分析佇列滿了就丟掉整段）。所以預設每秒只取 3 張進分析，趴臥、坐、站不需要更多，走和跑看 1 到 2 秒內的移動距離。取樣之後，追蹤確認所需的幀數、消失後保留 ID 的幀數都改成以秒計（`track_min_hits`、`max_missing_frames`），其他以秒計的視窗和速度門檻依實際分析幀率換算。
+
+- 實測：3 張／秒、1 到 2 隻動物、720p 時，每段分析用掉約 80% 的時間；4K 或更多隻時接近 100%，偶爾會丟一段。
+- 2 張／秒更省，但用錄好的影片模擬發現走和跑的判斷會變得不穩，不建議低於 3。
+- 開啟 `PET_IDENTIFY` 時，分析幀率低於 8 的話每一張都會取樣做寵物辨認。
+
 ### 環境變數
 
 | 變數 | 預設值 | 說明 |
@@ -83,6 +89,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 | `RTSP_URL` | 空 | `SOURCE_MODE=stream` 時必填 |
 | `VIDEO_PATH` | `input/dog_3.mp4` | `SOURCE_MODE=video` 時的影片路徑 |
 | `CLIP_DURATION_SECONDS` | `12` | 即時模式每段分析的秒數 |
+| `ANALYSIS_FPS` | `3` | 即時模式每秒只取幾張畫面分析，其餘只用來顯示（`/video_feed` 不受影響）；`0` = 每一張都分析（舊行為）。見下方說明 |
 | `PROJECT_DIR` | 程式所在資料夾 | `input/`、`output/` 的根目錄 |
 | `BEHAVIOR_EXPORT` | 空（關閉） | `dryrun`：行為區段只寫本機檔；`supabase`：另外上傳到 Supabase；其他值（除了 `off`）會在載入時報錯 |
 | `PET_ID` | 空 | 這支攝影機對應的寵物 uuid，寫進輸出的 `pet_id`（`supabase` 模式必填）；格式不對會報錯 |
